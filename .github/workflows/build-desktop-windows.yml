@@ -1,0 +1,99 @@
+# 桌面端 Windows 打包（个人使用，无签名）。
+#
+# 产出两类产物：
+# 1. NSIS 安装包（ZCode-<version>-win-x64.exe）
+# 2. zip 免安装版 / portable（ZCode-<version>-win-x64.zip），解压后直接运行 ZCode.exe
+#
+# 个人使用不做代码签名：不配置任何 CSC_LINK/WIN_CSC_LINK，electron-builder 默认跳过签名。
+# 构建链路复用 bundle.mjs 全流程（prepare runtime assets -> 生产构建 -> electron-builder -> 产物校验与体积审计）。
+
+name: Build Desktop (Windows, unsigned)
+
+on:
+  workflow_dispatch:
+    inputs:
+      arch:
+        description: "CPU 架构"
+        type: choice
+        options:
+          - x64
+        default: x64
+
+jobs:
+  build-desktop-windows:
+    runs-on: windows-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # build-metadata 读取 git 提交信息，浅克隆会导致版本元数据缺失。
+          fetch-depth: 0
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          # 与 mise.toml 锁定的 24.x 对齐。
+          node-version: 24
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          # 版本从根 package.json 的 packageManager 字段读取。
+          run_install: false
+
+      - name: Get pnpm store directory
+        id: pnpm-store
+        shell: bash
+        run: echo "store-dir=$(pnpm store path)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache pnpm store
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.pnpm-store.outputs.store-dir }}
+          key: pnpm-store-windows-x64-${{ hashFiles('pnpm-lock.yaml') }}
+          restore-keys: |
+            pnpm-store-windows-x64-
+
+      - name: Install dependencies
+        shell: bash
+        env:
+          # GitHub runner 直连官方源即可；国内网络环境打包时可切换到 npmmirror。
+          ELECTRON_MIRROR: https://npmmirror.com/mirrors/electron/
+        run: pnpm install --frozen-lockfile
+
+      - name: Build desktop (installer + portable zip)
+        shell: bash
+        env:
+          # 正式身份：无 _TEST 后缀，productName=ZCode。
+          ZCODE_ENV: production
+          # 一轮打包同时产出 NSIS 安装包与 zip portable 版。
+          ZCODE_DESKTOP_WIN_TARGETS: nsis,zip
+          ZCODE_TARGET_ARCH: ${{ inputs.arch || 'x64' }}
+          ELECTRON_MIRROR: https://npmmirror.com/mirrors/electron/
+        run: pnpm bundle:desktop -- --os win --arch "${ZCODE_TARGET_ARCH}"
+
+      - name: Collect artifacts
+        id: collect
+        shell: bash
+        run: |
+          mkdir -p artifacts
+          found=0
+          for file in packages/desktop/dist/*.exe packages/desktop/dist/*.zip; do
+            [ -e "$file" ] || continue
+            cp "$file" artifacts/
+            found=1
+          done
+          if [ "$found" -ne 1 ]; then
+            echo "no installer/zip artifacts found" >&2
+            exit 1
+          fi
+          ls -la artifacts
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: zcode-desktop-windows-${{ inputs.arch || 'x64' }}
+          path: artifacts/*
+          if-no-files-found: error
+          retention-days: 14

@@ -77,7 +77,8 @@ const archBuilderFlagMap = {
 
 const artifactExtensionsByOs = {
   mac: [".dmg", ".zip"],
-  win: [".exe"],
+  // ZCODE_DESKTOP_WIN_TARGETS=nsis,zip 时同一轮打包会同时产出安装包与 zip portable 版。
+  win: [".exe", ".zip"],
   linux: [".AppImage", ".deb", ".rpm", ".pkg.tar.zst"],
 };
 const artifactArchHintsByArch = {
@@ -378,7 +379,7 @@ function run(command, args, envPatch = {}) {
   });
 }
 
-function findBuiltArtifact(os, arch) {
+function findBuiltArtifacts(os, arch) {
   const distRoot = desktopDistRoot;
   const extensions = artifactExtensionsByOs[os] ?? [];
   const candidates = [];
@@ -412,7 +413,7 @@ function findBuiltArtifact(os, arch) {
   }
 
   candidates.sort((left, right) => right.mtimeMs - left.mtimeMs);
-  return candidates[0].path;
+  return candidates;
 }
 function runAndReadStdout(command, args) {
   return runCommandAndReadStdout(command, args, {
@@ -743,14 +744,18 @@ async function main() {
     verifyPackagedRuntimeDependencies(os, arch),
   );
 
-  const artifactPath = findBuiltArtifact(os, arch);
-  runTimedSync("bundle:audit-bundle-size", () =>
-    run(process.execPath, [
-      resolve(desktopRoot, "scripts", "audit-bundle-size.mjs"),
-      "--artifact-path",
-      artifactPath,
-    ]),
-  );
+  // ZCODE_DESKTOP_WIN_TARGETS=nsis,zip 之类的一次打包可能产出多个产物（安装包 + zip portable），
+  // 全部纳入体积审计，避免只审计最新一个文件放过另一个超限产物。
+  const builtArtifacts = findBuiltArtifacts(os, arch);
+  for (const artifact of builtArtifacts) {
+    runTimedSync("bundle:audit-bundle-size", () =>
+      run(process.execPath, [
+        resolve(desktopRoot, "scripts", "audit-bundle-size.mjs"),
+        "--artifact-path",
+        artifact.path,
+      ]),
+    );
+  }
 }
 
 const entryHref = process.argv[1] ? pathToFileURL(process.argv[1]).href : null;

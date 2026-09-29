@@ -25,6 +25,30 @@ const ELECTRON_BUILDER_ARCH = {
   1: "x64",
   3: "arm64",
 };
+// zip target 即官方 portable 语义：把 win-unpacked 目录打成单个 zip，解压直接运行。
+// 个人使用场景不需要签名；不注入 CSC_LINK/WIN_CSC_LINK 时 electron-builder 对两类 target 都不签名。
+const ALLOWED_WINDOWS_TARGETS = ["nsis", "zip"];
+function resolveWindowsTargets(env = process.env) {
+  const rawValue = env.ZCODE_DESKTOP_WIN_TARGETS?.trim();
+  if (!rawValue) {
+    return ["nsis"];
+  }
+  const targets = rawValue
+    .split(",")
+    .map((entry) => entry.trim().toLowerCase())
+    .filter(Boolean);
+  if (targets.length === 0) {
+    return ["nsis"];
+  }
+  const invalidTargets = targets.filter((target) => !ALLOWED_WINDOWS_TARGETS.includes(target));
+  if (invalidTargets.length > 0) {
+    throw new Error(
+      `[electron-builder.config] unsupported ZCODE_DESKTOP_WIN_TARGETS: ${invalidTargets.join(", ")}; allowed: ${ALLOWED_WINDOWS_TARGETS.join(", ")}`,
+    );
+  }
+  return targets;
+}
+
 function resolveElectronBuilderWindowsTarget({
   electronPlatformName,
   arch,
@@ -691,7 +715,7 @@ export default {
     ],
   },
   win: {
-    target: ["nsis"],
+    target: resolveWindowsTargets(),
     artifactName: buildDesktopArtifactName("win"),
   },
   linux: {
