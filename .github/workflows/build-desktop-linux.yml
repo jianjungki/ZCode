@@ -1,0 +1,104 @@
+# 桌面端 Linux 打包（个人使用，无签名）。
+#
+# 产出两类产物（x64 默认，可手动触发时切换 arm64）：
+# 1. AppImage 免安装版（ZCode-<version>-linux-x64.AppImage），chmod +x 后直接运行
+# 2. deb 安装包（ZCode-<version>-linux-x64.deb），适配 Debian 12+ / Ubuntu 22.04+
+#
+# rpm/pacman target 需要构建机提供 rpmbuild/pacman 与额外系统依赖，
+# 个人使用场景选择 AppImage + deb 两类 target；其余 target 仍可在本地打包时使用。
+# Linux 桌面应用没有统一的代码签名机制，electron-builder 也不会对 AppImage/deb 签名，
+# 所以天然无签名。构建链路复用 bundle.mjs 全流程。
+#
+# arm64 产物在 ubuntu-latest（x64 宿主机）上构建：config 的 prepare 链路已通过
+# ZCODE_TARGET_OS/ZCODE_TARGET_ARCH 拉取对应平台原生二进制（node-pty/koffi/native-search），
+# 无需 qemu/交叉编译工具链。
+
+name: Build Desktop (Linux, unsigned)
+
+on:
+  workflow_dispatch:
+    inputs:
+      arch:
+        description: "CPU 架构"
+        type: choice
+        options:
+          - x64
+          - arm64
+        default: x64
+
+jobs:
+  build-desktop-linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # build-metadata 读取 git 提交信息，浅克隆会导致版本元数据缺失。
+          fetch-depth: 0
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          # 与 mise.toml 锁定的 24.x 对齐。
+          node-version: 24
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          # 版本从根 package.json 的 packageManager 字段读取。
+          run_install: false
+
+      - name: Get pnpm store directory
+        id: pnpm-store
+        shell: bash
+        run: echo "store-dir=$(pnpm store path)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache pnpm store
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.pnpm-store.outputs.store-dir }}
+          key: pnpm-store-linux-${{ inputs.arch || 'x64' }}-${{ hashFiles('pnpm-lock.yaml') }}
+          restore-keys: |
+            pnpm-store-linux-${{ inputs.arch || 'x64' }}-
+
+      - name: Install dependencies
+        shell: bash
+        env:
+          # GitHub runner 直连官方源即可；国内网络环境打包时可切换到 npmmirror。
+          ELECTRON_MIRROR: https://npmmirror.com/mirrors/electron/
+        run: pnpm install --frozen-lockfile
+
+      - name: Build desktop (AppImage + deb)
+        shell: bash
+        env:
+          # 正式身份：无 _TEST 后缀，productName=ZCode。
+          ZCODE_ENV: production
+          ZCODE_TARGET_ARCH: ${{ inputs.arch || 'x64' }}
+          ELECTRON_MIRROR: https://npmmirror.com/mirrors/electron/
+        run: pnpm bundle:desktop -- --os linux --arch "${ZCODE_TARGET_ARCH}"
+
+      - name: Collect artifacts
+        id: collect
+        shell: bash
+        run: |
+          mkdir -p artifacts
+          found=0
+          for file in packages/desktop/dist/*.AppImage packages/desktop/dist/*.deb; do
+            [ -e "$file" ] || continue
+            cp "$file" artifacts/
+            found=1
+          done
+          if [ "$found" -ne 1 ]; then
+            echo "no AppImage/deb artifacts found" >&2
+            exit 1
+          fi
+          ls -la artifacts
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: zcode-desktop-linux-${{ inputs.arch || 'x64' }}
+          path: artifacts/*
+          if-no-files-found: error
+          retention-days: 14

@@ -49,6 +49,31 @@ function resolveWindowsTargets(env = process.env) {
   return targets;
 }
 
+// Linux target 开关与 win 对齐：个人使用的 GitHub Release 只需要 AppImage（通用免安装）
+// 与 deb（Debian/Ubuntu 系安装包）；rpm/pacman 需要构建机安装 rpmbuild/pacman 工具链，
+// release 矩阵的 ubuntu runner 默认不带，本地开发仍可用全量 target。
+const ALLOWED_LINUX_TARGETS = ["AppImage", "deb", "rpm", "pacman"];
+function resolveLinuxTargets(env = process.env) {
+  const rawValue = env.ZCODE_DESKTOP_LINUX_TARGETS?.trim();
+  if (!rawValue) {
+    return ["AppImage", "deb", "rpm", "pacman"];
+  }
+  const targets = rawValue
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+  if (targets.length === 0) {
+    return ["AppImage", "deb", "rpm", "pacman"];
+  }
+  const invalidTargets = targets.filter((target) => !ALLOWED_LINUX_TARGETS.includes(target));
+  if (invalidTargets.length > 0) {
+    throw new Error(
+      `[electron-builder.config] unsupported ZCODE_DESKTOP_LINUX_TARGETS: ${invalidTargets.join(", ")}; allowed: ${ALLOWED_LINUX_TARGETS.join(", ")}`,
+    );
+  }
+  return targets;
+}
+
 function resolveElectronBuilderWindowsTarget({
   electronPlatformName,
   arch,
@@ -719,7 +744,7 @@ export default {
     artifactName: buildDesktopArtifactName("win"),
   },
   linux: {
-    target: ["AppImage", "deb", "rpm", "pacman"],
+    target: resolveLinuxTargets(),
     artifactName: buildDesktopArtifactName("linux"),
     // desktop 包名是 scoped package（@zcode/desktop），electron-builder 默认会把
     // Linux executable/Icon 推成 @zcodedesktop。部分桌面环境无法按这个 icon name 命中

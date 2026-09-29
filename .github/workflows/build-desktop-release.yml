@@ -1,0 +1,239 @@
+# 桌面端三平台打包 + GitHub Release 发布。
+#
+# 触发方式：
+# 1. push tag（v*）：自动构建三平台并发布到该 tag 对应的 GitHub Release。
+# 2. workflow_dispatch：手动选平台/架构，可指定 tag（不填时以 package.json 版本打 v<version> tag 并发布）。
+#
+# 产物与单平台 build workflow 完全一致（同一 pnpm bundle:desktop 链路）：
+# - mac:   ZCode-<version>-mac-<arch>.dmg / .zip
+# - win:   ZCode-<version>-win-<arch>.exe / .zip
+# - linux: ZCode-<version>-linux-<arch>.AppImage / .deb
+#
+# 依旧不做代码签名/公证：三平台 build job 不注入任何 CSC_LINK/APPLE 凭据，
+# electron-builder 的 mac.identity 解析为 null，win 无 CSC_LINK 即不签名。
+# release 阶段用 softprops/action-gh-release 把三平台产物汇总上传到同一 Release，
+# mac/win/linux job 全部成功后才创建，避免只发一半平台。
+
+name: Build Desktop Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      os:
+        description: "平台（all = 三平台矩阵）"
+        type: choice
+        options:
+          - all
+          - mac
+          - win
+          - linux
+        default: all
+      arch:
+        description: "CPU 架构"
+        type: choice
+        options:
+          - default
+          - arm64
+          - x64
+        default: default
+      tag:
+        description: "发布到的 tag（留空 = 以 package.json 版本创建/复用 v<version>）"
+        type: string
+        default: ""
+      draft:
+        description: "先创建为草稿（草稿需手动 Publish 才对外可见）"
+        type: boolean
+        default: false
+
+permissions:
+  # 创建 Release 与上传产物必需。
+  contents: write
+
+jobs:
+  # 手动触发时先解析出目标 tag，供矩阵 job 与 release job 共用。
+  # tag push 触发时 GITHUB_REF_NAME 已是目标 tag，直接透传。
+  resolve-release-tag:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+      version: ${{ steps.tag.outputs.version }}
+      is-prerelease: ${{ steps.tag.outputs.is-prerelease }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve target tag
+        id: tag
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            tag="${GITHUB_REF_NAME}"
+          elif [ -n "${{ inputs.tag }}" ]; then
+            tag="${{ inputs.tag }}"
+          else
+            version=$(node -p "require('./package.json').version")
+            tag="v${version}"
+          fi
+          version="${tag#v}"
+          node -p "JSON.stringify({tag: process.argv[1], version: process.argv[2]})" "$tag" "$version" > resolved.json
+          $(node -p "process.execPath") -e "
+            const r = require('./resolved.json');
+            const fs = require('fs');
+            fs.appendFileSync(process.env.GITHUB_OUTPUT, 'tag=' + r.tag + '\n');
+            fs.appendFileSync(process.env.GITHUB_OUTPUT, 'version=' + r.version + '\n');
+            // 带预发布后缀（-alpha/-beta/-rc 之类）的版本按 prerelease 发布。
+            const isPrerelease = /-[0-9A-Za-z.-]+$/.test(r.version) ? 'true' : 'false';
+            fs.appendFileSync(process.env.GITHUB_OUTPUT, 'is-prerelease=' + isPrerelease + '\n');
+          "
+          echo "target tag=$tag version=$version"
+
+  build-desktop:
+    needs: resolve-release-tag
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # 三平台全量矩阵；手动触发只选单平台时用 if 过滤，矩阵保持静态可读。
+          - os: mac
+            runner: macos-latest
+            default-arch: arm64
+            targets-env: ""
+            build-targets: dmg,zip
+            artifact-exts: "*.dmg *.zip"
+          - os: win
+            runner: windows-latest
+            default-arch: x64
+            targets-env: "nsis,zip"
+            build-targets: nsis,zip
+            artifact-exts: "*.exe *.zip"
+          - os: linux
+            runner: ubuntu-latest
+            default-arch: x64
+            targets-env: "AppImage,deb"
+            build-targets: AppImage,deb
+            artifact-exts: "*.AppImage *.deb"
+    # 手动触发只选单平台时跳过其余矩阵项；tag push 恒为 all。
+    if: ${{ github.event_name == 'push' || inputs.os == 'all' || inputs.os == matrix.os }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    env:
+      # 正式身份：无 _TEST 后缀，productName=ZCode。
+      ZCODE_ENV: production
+      ZCODE_TARGET_ARCH: ${{ (inputs.arch && inputs.arch != 'default' && inputs.arch) || matrix.default-arch }}
+      ELECTRON_MIRROR: https://npmmirror.com/mirrors/electron/
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # build-metadata 读取 git 提交信息，浅克隆会导致版本元数据缺失。
+          fetch-depth: 0
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          # 与 mise.tomm 锁定的 24.x 对齐。
+          node-version: 24
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          # 版本从根 package.json 的 packageManager 字段读取。
+          run_install: false
+
+      - name: Get pnpm store directory
+        id: pnpm-store
+        shell: bash
+        run: echo "store-dir=$(pnpm store path)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache pnpm store
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.pnpm-store.outputs.store-dir }}
+          key: pnpm-store-${{ matrix.os }}-${{ env.ZCODE_TARGET_ARCH }}-${{ hashFiles('pnpm-lock.yaml') }}
+          restore-keys: |
+            pnpm-store-${{ matrix.os }}-${{ env.ZCODE_TARGET_ARCH }}-
+
+      - name: Install dependencies
+        shell: bash
+        run: pnpm install --frozen-lockfile
+
+      - name: Build desktop
+        shell: bash
+        env:
+          # win/linux 走各自的 target 开关；mac 的 dmg,zip 是 config 默认值，无需开关。
+          ZCODE_DESKTOP_WIN_TARGETS: ${{ matrix.os == 'win' && matrix.targets-env || '' }}
+          ZCODE_DESKTOP_LINUX_TARGETS: ${{ matrix.os == 'linux' && matrix.targets-env || '' }}
+        run: pnpm bundle:desktop -- --os "${{ matrix.os }}" --arch "${ZCODE_TARGET_ARCH}"
+
+      - name: Collect artifacts
+        id: collect
+        shell: bash
+        run: |
+          mkdir -p artifacts
+          found=0
+          for file in packages/desktop/dist/${{ matrix.artifact-exts }}; do
+            [ -e "$file" ] || continue
+            cp "$file" artifacts/
+            found=1
+          done
+          if [ "$found" -ne 1 ]; then
+            echo "no artifacts found for ${{ matrix.os }} (${{ matrix.artifact-exts }})" >&2
+            exit 1
+          fi
+          ls -la artifacts
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: zcode-desktop-release-${{ matrix.os }}-${{ env.ZCODE_TARGET_ARCH }}
+          path: artifacts/*
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    needs:
+      - resolve-release-tag
+      # 三平台全部成功才发布；fail-fast: false 时某平台失败会阻断 release，避免只发一半。
+      - build-desktop
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Download all platform artifacts
+        uses: actions/download-artifact@v4
+        with:
+          # 只取 release 前缀产物；tag push 触发时矩阵恒为三平台全量。
+          pattern: zcode-desktop-release-*
+          merge-multiple: true
+          path: release-assets
+
+      - name: List release assets
+        shell: bash
+        run: ls -la release-assets
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.resolve-release-tag.outputs.tag }}
+          name: ZCode ${{ needs.resolve-release-tag.outputs.tag }}
+          # tag push 已带完整提交历史；手动触发时 checkout 一次供 release notes 生成提交列表。
+          generate_release_notes: true
+          draft: ${{ github.event_name == 'workflow_dispatch' && inputs.draft }}
+          prerelease: ${{ needs.resolve-release-tag.outputs.is-prerelease == 'true' }}
+          body: |
+            ZCode 桌面端 ${{ needs.resolve-release-tag.outputs.tag }}。
+
+            | 平台 | 产物 | 说明 |
+            | --- | --- | --- |
+            | macOS (arm64) | ZCode-${{ needs.resolve-release-tag.outputs.version }}-mac-arm64.dmg / .zip | dmg 安装，zip 解压直接运行；未签名，首次打开右键 -> 打开（或 `xattr -cr /Applications/ZCode.app`） |
+            | macOS (x64) | ZCode-${{ needs.resolve-release-tag.outputs.version }}-mac-x64.dmg / .zip | Intel 芯片，同上 |
+            | Windows (x64) | ZCode-${{ needs.resolve-release-tag.outputs.version }}-win-x64.exe / .zip | NSIS 安装包；zip 为免安装版；未签名，SmartScreen 提示选"仍要运行" |
+            | Linux (x64) | ZCode-${{ needs.resolve-release-tag.outputs.version }}-linux-x64.AppImage / .deb | AppImage 通用免安装；deb 适用于 Debian/Ubuntu 系 |
+            | Linux (arm64) | ZCode-${{ needs.resolve-release-tag.outputs.version }}-linux-arm64.AppImage / .deb | ARM 芯片 |
+
+            全部产物未做代码签名/公证，均由 GitHub Actions 从源码构建。
+          files: release-assets/*

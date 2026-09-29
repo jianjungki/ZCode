@@ -1,0 +1,102 @@
+# 桌面端 macOS 打包（个人使用，无签名）。
+#
+# 产出两类产物（arm64 默认，可手动触发时切换 x64）：
+# 1. DMG 安装包（ZCode-<version>-mac-arm64.dmg）
+# 2. zip 免安装版（ZCode-<version>-mac-arm64.zip），解压后直接运行 ZCode.app
+#
+# 个人使用不做代码签名：不配置 APPLE_SIGNING_IDENTITY/CSC_NAME 时，
+# electron-builder.config.js 的 mac.identity 解析为 null，electron-builder 跳过签名；
+# 首次打开按 Gatekeeper 提示右键 -> 打开即可（或执行 xattr -cr /Applications/ZCode.app）。
+# 也不做公证：config 里 mac.notarize 已显式 false，build 阶段不会读取 Apple 凭据。
+# 构建链路复用 bundle.mjs 全流程（prepare runtime assets -> 生产构建 -> electron-builder -> 产物校验与体积审计）。
+
+name: Build Desktop (macOS, unsigned)
+
+on:
+  workflow_dispatch:
+    inputs:
+      arch:
+        description: "CPU 架构"
+        type: choice
+        options:
+          - arm64
+          - x64
+        default: arm64
+
+jobs:
+  build-desktop-macos:
+    runs-on: macos-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # build-metadata 读取 git 提交信息，浅克隆会导致版本元数据缺失。
+          fetch-depth: 0
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          # 与 mise.toml 锁定的 24.x 对齐。
+          node-version: 24
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          # 版本从根 package.json 的 packageManager 字段读取。
+          run_install: false
+
+      - name: Get pnpm store directory
+        id: pnpm-store
+        shell: bash
+        run: echo "store-dir=$(pnpm store path)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache pnpm store
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.pnpm-store.outputs.store-dir }}
+          key: pnpm-store-macos-${{ inputs.arch || 'arm64' }}-${{ hashFiles('pnpm-lock.yaml') }}
+          restore-keys: |
+            pnpm-store-macos-${{ inputs.arch || 'arm64' }}-
+
+      - name: Install dependencies
+        shell: bash
+        env:
+          # GitHub runner 直连官方源即可；国内网络环境打包时可切换到 npmmirror。
+          ELECTRON_MIRROR: https://npmmirror.com/mirrors/electron/
+        run: pnpm install --frozen-lockfile
+
+      - name: Build desktop (dmg + zip)
+        shell: bash
+        env:
+          # 正式身份：无 _TEST 后缀，productName=ZCode。
+          ZCODE_ENV: production
+          # 不注入 APPLE_SIGNING_IDENTITY/CSC_NAME/ZCODE_ENABLE_MAC_SIGN，全程无签名无公证。
+          ZCODE_TARGET_ARCH: ${{ inputs.arch || 'arm64' }}
+          ELECTRON_MIRROR: https://npmmirror.com/mirrors/electron/
+        run: pnpm bundle:desktop -- --os mac --arch "${ZCODE_TARGET_ARCH}"
+
+      - name: Collect artifacts
+        id: collect
+        shell: bash
+        run: |
+          mkdir -p artifacts
+          found=0
+          for file in packages/desktop/dist/*.dmg packages/desktop/dist/*.zip; do
+            [ -e "$file" ] || continue
+            cp "$file" artifacts/
+            found=1
+          done
+          if [ "$found" -ne 1 ]; then
+            echo "no dmg/zip artifacts found" >&2
+            exit 1
+          fi
+          ls -la artifacts
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: zcode-desktop-macos-${{ inputs.arch || 'arm64' }}
+          path: artifacts/*
+          if-no-files-found: error
+          retention-days: 14
