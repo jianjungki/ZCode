@@ -12,7 +12,7 @@
 # 依旧不做代码签名/公证：三平台 build job 不注入任何 CSC_LINK/APPLE 凭据，
 # electron-builder 的 mac.identity 解析为 null，win 无 CSC_LINK 即不签名。
 # release 阶段用 softprops/action-gh-release 把三平台产物汇总上传到同一 Release，
-# mac/win/linux job 全部成功后才创建，避免只发一半平台。
+# 所选平台 job 全部成功后才创建，避免只发一半平台。
 
 name: Build Desktop Release
 
@@ -53,7 +53,7 @@ permissions:
   contents: write
 
 jobs:
-  # 手动触发时先解析出目标 tag，供矩阵 job 与 release job 共用。
+  # 先解析目标 tag 与平台矩阵，供构建 job 与 release job 消费。
   # tag push 触发时 GITHUB_REF_NAME 已是目标 tag，直接透传。
   resolve-release-tag:
     runs-on: ubuntu-latest
@@ -61,11 +61,23 @@ jobs:
       tag: ${{ steps.tag.outputs.tag }}
       version: ${{ steps.tag.outputs.version }}
       is-prerelease: ${{ steps.tag.outputs.is-prerelease }}
+      matrix: ${{ steps.matrix.outputs.matrix }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Resolve build matrix
+        id: matrix
+        env:
+          RELEASE_OS: ${{ inputs.os }}
+        run: node scripts/resolve-desktop-release-matrix.mjs
 
       - name: Resolve target tag
         id: tag
@@ -96,29 +108,8 @@ jobs:
     needs: resolve-release-tag
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          # 三平台全量矩阵；手动触发只选单平台时用 if 过滤，矩阵保持静态可读。
-          - os: mac
-            runner: macos-latest
-            default-arch: arm64
-            targets-env: ""
-            build-targets: dmg,zip
-            artifact-exts: "*.dmg *.zip"
-          - os: win
-            runner: windows-latest
-            default-arch: x64
-            targets-env: "nsis,zip"
-            build-targets: nsis,zip
-            artifact-exts: "*.exe *.zip"
-          - os: linux
-            runner: ubuntu-latest
-            default-arch: x64
-            targets-env: "AppImage,deb"
-            build-targets: AppImage,deb
-            artifact-exts: "*.AppImage *.deb"
-    # 手动触发只选单平台时跳过其余矩阵项；tag push 恒为 all。
-    if: ${{ github.event_name == 'push' || inputs.os == 'all' || inputs.os == matrix.os }}
+      # job 级 if 不支持 matrix 上下文；前置 job 已按触发方式筛选好平台。
+      matrix: ${{ fromJSON(needs.resolve-release-tag.outputs.matrix) }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 120
     env:
@@ -198,7 +189,7 @@ jobs:
   release:
     needs:
       - resolve-release-tag
-      # 三平台全部成功才发布；fail-fast: false 时某平台失败会阻断 release，避免只发一半。
+      # 所选平台全部成功才发布；fail-fast: false 时某平台失败会阻断 release，避免只发一半。
       - build-desktop
     runs-on: ubuntu-latest
     timeout-minutes: 15
