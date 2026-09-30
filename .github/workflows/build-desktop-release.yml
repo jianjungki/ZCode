@@ -164,18 +164,27 @@ jobs:
       - name: Collect artifacts
         id: collect
         shell: bash
+        env:
+          ARTIFACT_PATTERNS: ${{ matrix.artifact-exts }}
         run: |
           mkdir -p artifacts
-          found=0
-          for file in packages/desktop/dist/${{ matrix.artifact-exts }}; do
-            [ -e "$file" ] || continue
-            cp "$file" artifacts/
-            found=1
+          read -r -a patterns <<< "$ARTIFACT_PATTERNS"
+          for pattern in "${patterns[@]}"; do
+            found=0
+            # 多模式拼接只会给首项加 dist 前缀，导致 zip/deb 在仓库根目录查找；逐项展开修复漏传。
+            # 此处刻意不引用 pattern，让扩展名通配符在 dist 目录展开。
+            # shellcheck disable=SC2086
+            for file in packages/desktop/dist/$pattern; do
+              [ -f "$file" ] || continue
+              cp "$file" artifacts/
+              found=1
+            done
+            # 每种预期产物都必须存在，避免只有安装包时仍然成功发布。
+            if [ "$found" -ne 1 ]; then
+              echo "no artifacts found for ${{ matrix.os }} (packages/desktop/dist/$pattern)" >&2
+              exit 1
+            fi
           done
-          if [ "$found" -ne 1 ]; then
-            echo "no artifacts found for ${{ matrix.os }} (${{ matrix.artifact-exts }})" >&2
-            exit 1
-          fi
           ls -la artifacts
 
       - name: Upload workflow artifact

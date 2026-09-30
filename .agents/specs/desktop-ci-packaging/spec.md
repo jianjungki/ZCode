@@ -111,6 +111,31 @@ flowchart LR
 5. 使用 `node --test scripts/resolve-desktop-release-matrix.test.mjs` 验证真实脚本的输入、
    输出文件和失败行为；类型检查、lint 与架构检查使用根目录现有命令。
 
+## Release 产物完整性
+
+- `build-desktop` 的 `Collect artifacts` 步骤是本次构建产物集合的唯一所有者。
+  矩阵的 `artifact-exts` 经 `ARTIFACT_PATTERNS` 环境变量传入，按空格拆分为模式列表；
+  每个模式必须在 `packages/desktop/dist/` 内展开，不能只给第一个模式加目录前缀。
+- Windows 必须同时收集 `.exe` 与 `.zip`，macOS 必须同时收集 `.dmg` 与 `.zip`，
+  Linux 必须同时收集 `.AppImage` 与 `.deb`。仓库根目录中的同扩展名文件不能被收集。
+- 每个模式至少匹配一个普通文件，否则收集步骤失败，并报告缺失的模式。
+  后续 workflow artifact 上传和 Release 发布依赖成功结果，不发布不完整的产物集合。
+- 修复只改变 Release workflow 的收集步骤；矩阵元数据、打包 target、单平台 workflow
+  和最终 Release 上传入口继续使用现有定义。
+
+```mermaid
+flowchart LR
+  A[bundle：在 dist 生成产物] --> B[Collect artifacts：逐个模式校验并收集]
+  B -->|每种产物均存在| C[上传 workflow artifact]
+  C --> D[全部所选平台成功后创建 Release]
+  B -->|缺少任一种产物| E[失败并阻断上传与发布]
+```
+
+回归测试 `node --test scripts/desktop-release-artifacts.test.mjs` 直接执行 workflow 中的
+Bash 收集步骤，覆盖三平台双产物、带空格的路径与文件名、仓库根目录的干扰 zip、
+每个平台缺少任一产物及空 dist。Windows 本地测试通过 `BASH_PATH` 指定 Git Bash；
+Linux / macOS 默认使用 PATH 中的 Bash。
+
 ## 验收场景
 
 1. **默认不变**：不设置 `ZCODE_DESKTOP_WIN_TARGETS` 时，config 的 `win.target` 仍为
